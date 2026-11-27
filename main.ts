@@ -1,6 +1,7 @@
 // Fast exact drop-in for makefun-diff 1.0.0: the harness runs `node /bot/main.ts` (node22). It reads every case from /input/cases.json (a JSON
 // array of {id, input}), answers each one alone with run() from solve.js, and writes /output/answers.json: a JSON
 // array of the answers, one per case and in the cases' order. Outside a container MAKEFUN_INPUT_DIR and MAKEFUN_OUTPUT_DIR stand in for /input and /output.
+// This driver is kept verbatim from the kit's house baseline (the competition's rules: an entry keeps this driver and replaces solve.js).
 
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
