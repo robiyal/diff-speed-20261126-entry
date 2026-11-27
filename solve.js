@@ -1,22 +1,28 @@
 // Fast exact drop-in for makefun-diff 1.0.0 (MIT).
 //
 // Returns make.fun's own patch of { old, new } exactly as vendor/makefun-diff
-// 1.0.0 does, but without its allocation cost: the reference builds one path
-// object (plus a linked component) per (d, k) step of Myers's search, i.e.
-// O(D^2) short-lived objects per case. This implementation runs the same
-// search — same diagonals, same order, same tie-break (a deletion wins over
-// an insertion when both reach the same point), same snakes, no edge pruning
-// — over interned line ids in typed arrays, keeping only one Int32Array of
-// furthest-x values per depth d, then backtracks the edit script from those
-// values. The patch/hunk writer is a direct port of the reference's.
+// 1.0.0 does. The Myers search itself runs in WebAssembly (myers.ts, compiled
+// with AssemblyScript, embedded below as base64: 1,168 bytes): the same greedy
+// search as the pure-JS V1 — same diagonals, same order, same tie-break (a
+// deletion wins over an insertion when both reach the same point), same
+// snakes, no edge pruning — over the same interned line ids, with all V
+// arrays in one flat WASM-memory buffer instead of one Int32Array per depth,
+// and with the search restricted to the diagonal band d + |K-k| <= U, where
+// U is the length of a valid edit script (patienceU below, within ~1% of
+// the true distance on the practice set). The band is exact: the reference
+// path has total D <= U, and at depth d on diagonal k its remaining edits
+// are at least |K-k|, so d + |K-k| <= D <= U on every state of the
+// reference path. Anything unexpected (WASM unavailable, a trap, a failed
+// memory grow, the search not reaching both ends — including a U below the
+// true distance, which cannot happen for a valid script) falls back to the
+// identical pure-JS search kept in this file, so exactness never depends
+// on the WASM path or on the heuristic.
 //
-// Verified exact: practice set 4/4 identical to the reference, plus a
-// differential fuzz of 1,582 generated cases (empty/CRLF/bare endings,
-// duplicates, swaps, moved blocks) with 0 mismatches. Local speed on this
-// VM: solve() 351 ms/set vs the reference's 1,304 ms/set (3.7x); whole
-// entry ~0.73 s vs ~1.8 s cold. Anchor-splitting was considered and
-// rejected: the reference itself drops a unique, same-position line
-// (old A/X/B into new B/X/A keeps A, drops X), so no anchor split is safe.
+// The patch/hunk writer is a direct port of the reference's. Verified exact:
+// practice set 4/4 identical to the reference, plus a differential fuzz
+// against the reference (see the submission report). Anchor-splitting was
+// considered and rejected: the reference itself drops a unique, same-position
+// line (old A/X/B into new B/X/A keeps A, drops X), so no anchor split is safe.
 //
 // Lines: a text is cut after every "\n"; a last line with no "\n" is a line
 // too; two lines are equal only when they are the same code units, newline
@@ -25,7 +31,176 @@
 // ends with "\n", so the flag keeps the two apart while one shared map
 // interns both texts.
 
+// The WebAssembly Myers core (myers.ts -> AssemblyScript 0.28.20, --optimize
+// --runtime stub --importMemory), base64. Decoded and instantiated once at
+// import time; a failure there disables the WASM path (JS fallback below).
+const WASM_B64 = "AGFzbQEAAAABDQFgCH9/f39/f39/AX8CDwEDZW52Bm1lbW9yeQIAAAMCAQAHEgIFbXllcnMAAAZtZW1vcnkCAArNCAHKCAEQfyABIANyRQRAQQAPCwNAIAMgDEogASAISnEEfyAAIAhBAnRqKAIAIAIgDEECdGooAgBGBUEACwRAIAhBAWohCCAMQQFqIQwMAQsLIAQgCEEBajYCCCAEQQA2AgAgBEEANgIEIARBADYCDCAEQQA2AhAgAyAMTCABIAhMcSEQPwBBEHQhCSABIANrIRJBASEIA0AgEEUgCCABIANqTHEEQCAEIAhBAWoiCyALbCALQQJ0akECdGoiCyAJSgRAIAsgCWtB//8DakEQdUEQakAAQQBIBEBBfw8LPwBBEHQhCQsgBCAIQQFrIgsgC2wgC0ECdGpBAnRqIRMgBCAIIAhsIAhBAnRqQQJ0aiIPQQA2AgAgD0EANgIEIA8gCEEBdCILQQNqQQJ0akEANgIAIA8gC0EEakECdGpBADYCACASIAcgCGsiDmsiDEEAIAhrIgtOBEAgDCELCyALQQFqIAsgCCALa0EBcRshDCAOIBJqIgsgCEoEQCAIIQsLIAtBAWsgCyAIIAtrQQFxGyEUA0AgDCAUTARAAkAgEyAIIAxqIgtBAnRqKAIAIRYCQCADQQFqIBMgC0ECakECdCIVaigCACIXIAxrTkEAIBcbIgsgASAWTkEAIBYbIg5yRQRAIA8gFWpBADYCAAwBCyAWIBdBAWsgDgR/IAtFIBZBAWogF05yBUEACxsiDiAMayELA0AgAyALSiABIA5KcQR/IAAgDkECdGooAgAgAiALQQJ0aigCAEYFQQALBEAgDkEBaiEOIAtBAWohCwwBCwsgDyAIIAxqQQJqQQJ0aiAOQQFqNgIAIAMgC0wgASAOTHEEQCAIIQpBASEQDAILCyAMQQJqIQwMAgsLCyAIQQFqIQgMAQsLIBBFBEBBfg8LIAEhAiADIQADQCAKQQBKBEAgBCAKQQFrIgcgB2wgB0ECdGpBAnRqIgcgAiAAayIIIApqIglBAnRqKAIAIQsgA0EBaiAHIAlBAmpBAnRqKAIAIgcgCGtOQQAgBxshCCABIAtOQQAgCxsEfyAIRSALQQFqIAdOcgVBAAsEf0EBIQwgC0EBawVBACEMIAdBAWsLIAxqIQcDQCACIAdKBEAgBiANQQJ0akEANgIAIA1BAWohDSACQQFrIQIgAEEBayEADAELCyAMBEAgBiANQQJ0akEBNgIAIAJBAWshAgUgBiANQQJ0akECNgIAIABBAWshAAsgDUEBaiENIApBAWshCgwBCwsDQCACQQBKBEAgBiANQQJ0akEANgIAIA1BAWohDSACQQFrIQIgAEEBayEADAELCyANQQFrIQMDQCADQQBOBEAgBiADQQJ0aigCACEAQQEhAiADQQFrIQMDQCADQQBOBH8gBiADQQJ0aigCACAARgVBAAsEQCACQQFqIQIgA0EBayEDDAELCyAFIBFBA3RqIgEgADYCACABIAI2AgQgEUEBaiERDAELCyARCw==";
 const BARE = 1 << 30;
+
+let wasmMyers = null;
+let wasmMemory = null;
+try {
+  const bytes = Uint8Array.from(atob(WASM_B64), (c) => c.charCodeAt(0));
+  wasmMemory = new WebAssembly.Memory({ initial: 1, maximum: 4096 });
+  const mod = new WebAssembly.Module(bytes);
+  const inst = new WebAssembly.Instance(mod, { env: { memory: wasmMemory } });
+  if (typeof inst.exports.myers === 'function') wasmMyers = inst.exports.myers;
+} catch {
+  wasmMyers = null;
+  wasmMemory = null;
+}
+
+/**
+ * Length of a valid edit script for A[0..N) into B[0..M), by a resync
+ * walk: snake while equal, else jump to the next resync found by indexOf
+ * within W lines (insert the lines before it, or delete up to it), else
+ * delete one line and retry. Every step is a legal edit, so the total is
+ * a valid script length and therefore >= the true distance D. Only used
+ * for short gaps between patience anchors, where it tracks D closely.
+ */
+function resyncU(A, B, N, M, W) {
+  let x = 0;
+  let y = 0;
+  let u = 0;
+  while (x < N || y < M) {
+    while (x < N && y < M && A[x] === B[y]) {
+      x++;
+      y++;
+    }
+    if (x >= N) return u + (M - y);
+    if (y >= M) return u + (N - x);
+    const pB = B.subarray(y, Math.min(M, y + W)).indexOf(A[x]);
+    const pA = A.subarray(x, Math.min(N, x + W)).indexOf(B[y]);
+    if (pB >= 0 && (pA < 0 || pB <= pA)) {
+      u += pB;
+      y += pB;
+    } else if (pA >= 0) {
+      u += pA;
+      x += pA;
+    } else {
+      x++;
+      u++;
+    }
+  }
+  return u;
+}
+
+/**
+ * Length of a valid edit script for A[0..N) into B[0..M) (patience
+ * alignment): lines occurring exactly once in each text are anchors; the
+ * longest increasing subsequence of their B positions (in A order) is a
+ * monotone alignment, and every gap between consecutive anchors — plus
+ * the head and tail gaps — is scored by resyncU, which is itself a valid
+ * script. The sum is therefore a valid script length, >= D. On the
+ * practice set it lands within ~1% of D (U/D 1.001-1.008), which is what
+ * makes the WASM diagonal band cut the search roughly in half. A bare
+ * final line (BARE flag) only anchors to a bare line with the same text.
+ */
+function patienceU(A, B, N, M) {
+  let maxId = 0;
+  for (let i = 0; i < N; i++) {
+    const id = A[i] & ~BARE;
+    if (id > maxId) maxId = id;
+  }
+  for (let i = 0; i < M; i++) {
+    const id = B[i] & ~BARE;
+    if (id > maxId) maxId = id;
+  }
+  const cA = new Int32Array(maxId + 1);
+  const cB = new Int32Array(maxId + 1);
+  for (let i = 0; i < N; i++) cA[A[i] & ~BARE]++;
+  for (let i = 0; i < M; i++) cB[B[i] & ~BARE]++;
+  const posB = new Int32Array(maxId + 1).fill(-1);
+  for (let j = 0; j < M; j++) {
+    const id = B[j] & ~BARE;
+    if (cB[id] === 1) posB[id] = j;
+  }
+  const ai = [];
+  const aj = [];
+  for (let i = 0; i < N; i++) {
+    const id = A[i] & ~BARE;
+    if (cA[id] !== 1 || cB[id] !== 1) continue;
+    const j = posB[id];
+    if (j < 0 || (A[i] & BARE) !== (B[j] & BARE)) continue;
+    ai.push(i);
+    aj.push(j);
+  }
+  const n = ai.length;
+  const tails = [];
+  const prev = new Int32Array(n).fill(-1);
+  for (let i = 0; i < n; i++) {
+    let lo = 0;
+    let hi = tails.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (aj[tails[mid]] < aj[i]) lo = mid + 1;
+      else hi = mid;
+    }
+    if (lo > 0) prev[i] = tails[lo - 1];
+    if (lo === tails.length) tails.push(i);
+    else tails[lo] = i;
+  }
+  let U = 0;
+  let pi = -1;
+  let pj = -1;
+  let cur = tails.length ? tails[tails.length - 1] : -1;
+  const anchors = [];
+  while (cur >= 0) {
+    anchors.push([ai[cur], aj[cur]]);
+    cur = prev[cur];
+  }
+  anchors.reverse();
+  anchors.push([N, M]);
+  for (let a = 0; a < anchors.length; a++) {
+    const i = anchors[a][0];
+    const j = anchors[a][1];
+    const ga = i - pi - 1;
+    const gb = j - pj - 1;
+    if (ga > 0 || gb > 0) {
+      if (ga === 0) U += gb;
+      else if (gb === 0) U += ga;
+      else U += resyncU(A.subarray(pi + 1, i), B.subarray(pj + 1, j), ga, gb, 64);
+    }
+    pi = i;
+    pj = j;
+  }
+  return U;
+}
+
+/**
+ * The edit script of A[0..N) into B[0..M) via WebAssembly, as runs
+ * [kind, count] in order, kind 0 = keep, 1 = delete, 2 = insert.
+ * Returns null when the WASM path cannot answer (caller falls back).
+ */
+function myersRunsWasm(A, B, N, M) {
+  if (wasmMyers === null || wasmMemory === null) return null;
+  if (N === 0 && M === 0) return [];
+  const U = patienceU(A, B, N, M);
+  // Layout (bytes, all 4-aligned): A | B | scratch | runs | V storage.
+  const aPtr = 0;
+  const bPtr = 4 * N;
+  const scrPtr = bPtr + 4 * M;
+  const outPtr = scrPtr + 4 * (N + M + 8);
+  const vPtr = outPtr + 8 * (N + M + 8);
+  try {
+    const need = vPtr + 64;
+    if (wasmMemory.buffer.byteLength < need) {
+      const grow = Math.ceil((need - wasmMemory.buffer.byteLength) / 65536);
+      if (wasmMemory.grow(grow) < 0) return null;
+    }
+    const mem = new Int32Array(wasmMemory.buffer);
+    mem.set(A, aPtr >> 2);
+    mem.set(B, bPtr >> 2);
+    const count = wasmMyers(aPtr, N, bPtr, M, vPtr, outPtr, scrPtr, U);
+    if (typeof count !== 'number' || count < 0) return null;
+    const out = new Int32Array(wasmMemory.buffer, outPtr, count * 2);
+    const runs = new Array(count);
+    for (let i = 0; i < count; i++) runs[i] = [out[i * 2], out[i * 2 + 1]];
+    return runs;
+  } catch {
+    return null;
+  }
+}
 
 /** Split a text into lines (parts without "\n") and interned line ids. */
 function tokenize(text, map) {
@@ -185,7 +360,10 @@ export function run(input) {
   }
   const runs = [];
   if (lo > 0) runs.push([0, lo]);
-  const mid = myersRuns(A.subarray(lo, hiA), B.subarray(lo, hiB), hiA - lo, hiB - lo);
+  const midN = hiA - lo;
+  const midM = hiB - lo;
+  const mid = myersRunsWasm(A.subarray(lo, hiA), B.subarray(lo, hiB), midN, midM)
+    ?? myersRuns(A.subarray(lo, hiA), B.subarray(lo, hiB), midN, midM);
   for (let i = 0; i < mid.length; i++) runs.push(mid[i]);
   if (n - hiA > 0) runs.push([0, n - hiA]);
 
